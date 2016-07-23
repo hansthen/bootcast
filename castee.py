@@ -6,7 +6,7 @@ import requests
 import logging
 import argparse
 
-logging.basicConfig(level='DEBUG')
+logging.basicConfig()
 logger = logging.getLogger(__file__)
 
 
@@ -56,11 +56,10 @@ def main(args):
             else:
                 f.seek((i - 1) * page_size)
                 f.write(data)
-                logger.debug("Received page %d", i)
+                logger.debug("Received page %d of %d", i, pages)
                 missing.remove(i)
 
-            # If we have all pages, send a leave request
-            # and exit the loop
+            # If we have all pages, send a leave request and exit loop
             if not missing:
                 logger.debug("All pages received")
                 r = requests.get(args.url.replace('join', 'leave', 1),

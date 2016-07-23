@@ -17,20 +17,24 @@ logging.basicConfig()
 logger = logging.getLogger(__file__)
 
 
-Cast = namedtuple('Cast', ['filename', 'session',
-                           'pages', 'page_size', 'throttle',
-                           'address', 'port', 'clients'])
+Cast = namedtuple('Cast', ['app', 'filename', 'stop', 'counter',
+                           'pages', 'address', 'port', 'clients'])
 
 
 def broadcast(cast):
     """Broadcast the file"""
-    page_size = cast.page_size
+    cast.app.casts[cast.filename] = cast
+    page_size = cast.app.args.page_size
+    throttle = cast.app.args.throttle
     filename = cast.filename
-    session = cast.session
     total = cast.pages
+    stop = cast.stop
+    counter = cast.counter
+    counter.counter = 0
 
     logger.debug("start broadcast of %s", filename)
     logger.debug("%d pages" % total)
+
     # This is ugly but keeps flake8 from complaining
     with open(filename) as f, closing(socket.socket(socket.AF_INET,
                                       socket.SOCK_DGRAM)) as sock:
@@ -41,23 +45,37 @@ def broadcast(cast):
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
         loop = 0
-        while not session.is_set():
+        while not stop.is_set():
+            logger.debug("Starting loop %d %d", loop, counter.counter)
             loop += 1
+            page = 0
+            f.seek(0)
             data = f.read(page_size)
-            i = 0
+
+            if counter.is_set():
+                logger.debug('reset inactivity counter %d' % loop)
+                counter.counter = 0
+                counter.clear()
+            else:
+                counter.counter += 1
+
+            if counter.counter > 5:
+                stop.set()
+
             while data:
-                if session.is_set():
+                if stop.is_set():
                     logger.debug('shutting down thread in loop %d' % loop)
                     break
-                i += 1
+
+                page += 1
                 check = checksum(data)
-                msg = struct.pack('!IIII%ds' % len(data), i, total,
+                msg = struct.pack('!IIII%ds' % len(data), page, total,
                                   check, len(data), data)
-                # logger.debug("sending page %d, length %d" % (i, len(data)))
+                # logger.debug("sending page %d[%d]" % (page, len(data)))
                 sock.sendto(msg, (cast.address, cast.port))
                 data = f.read(page_size)
-                sleep(cast.throttle)
-            f.seek(0)
+                sleep(throttle)
+        del cast.app.casts[filename]
 
 
 def checksum(st):
@@ -70,27 +88,30 @@ class JoinHandler(tornado.web.RequestHandler):
     def get(self, path):
         broadcasts = self.application.casts
         args = self.application.args
-        client = uuid1().hex
+        client = intern(uuid1().hex)
         page_size = args.page_size
+        path = os.path.join(args.dir, path)
+        if not os.path.exists(path):
+            raise tornado.web.HTTPError(status_code=404,
+                                        log_message="Path %s not found" % path)
         pages = os.path.getsize(path) / page_size + 1
 
         # if the cast is alreay running attach client
         if path in broadcasts:
             cast = broadcasts[path]
             cast.clients.append(client)
+            cast.counter.set()
         # if the cast is not running start it first
         else:
             address = args.group
-            throttle = args.throttle
             port = args.start + len(broadcasts)
-            cast = Cast(path, Event(), pages, page_size,
-                        throttle, address, port, [client])
-            broadcasts[path] = cast
+            cast = Cast(self.application, path, Event(), Event(),
+                        pages, address, port, [client])
             t = Thread(target=broadcast, args=(cast,))
             t.start()
 
         # send connection data to the client
-        self.write("CONNECT=%s:%d\n" % (address, port))
+        self.write("CONNECT=%s:%d\n" % (cast.address, cast.port))
         self.write("TOKEN=%s\n" % (client))
         self.write("PAGES=%d\n" % (pages))
         self.write("PAGESIZE=%d\n" % (page_size))
@@ -100,17 +121,24 @@ class JoinHandler(tornado.web.RequestHandler):
 class LeaveHandler(tornado.web.RequestHandler):
     """Handles a leave request"""
     def get(self, path):
-        token = self.request.headers.get('X-TOKEN')
+        token = intern(self.request.headers.get('X-TOKEN'))
         casts = self.application.casts
+        logger.debug("removing client %s", token)
+        path = os.path.join(args.dir, path)
         if path in casts:
             cast = casts[path]
             clients = cast.clients
             clients.remove(token)
+            cast.counter.set()
             if not clients:
                 # stop the broadcast
-                cast.session.set()
-                del casts[path]
+                cast.stop.set()
                 logger.debug("stop broadcast %s", path)
+            else:
+                pass
+        else:
+            logger.error("Received leave request from unknown broadcast %s",
+                         path)
 
 
 def make_app():
@@ -120,9 +148,10 @@ def make_app():
     ])
 
 parser = argparse.ArgumentParser(description="Start a file caster")
-parser.add_argument('--dir', help="the directory from which files are served")
+parser.add_argument('--dir', help="the directory from which files are served",
+                    default='')
 parser.add_argument('--page-size', '-s', type=int,
-                    help="the page size", default=2000)
+                    help="the page size", default=1450)
 parser.add_argument('--ip',
                     help="the listener ip address", default='')
 parser.add_argument('--port', '-p', type=int,
@@ -144,8 +173,9 @@ if __name__ == '__main__':
     app.casts = {}
     app.args = args
     app.listen(args.port)
+    logger.setLevel(args.logLevel)
     try:
         tornado.ioloop.IOLoop.current().start()
     except KeyboardInterrupt:
         for value in app.casts.itervalues():
-            value.session.set()
+            value.stop.set()
